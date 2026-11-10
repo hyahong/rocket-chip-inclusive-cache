@@ -32,8 +32,21 @@ class InclusiveCache(
   val micro: InclusiveCacheMicroParameters,
   control: Option[InclusiveCacheControlParameters] = None
   )(implicit p: Parameters)
-    extends LazyModule
+    extends LazyModule with LazyScope
 {
+  private val resultClients = scala.collection.mutable.ArrayBuffer.empty[
+    (TLClientNode, IdRange, BundleBridgeSource[DecoupledIO[CacheAccessResult]])]
+
+  def observeAccesses(client: TLClientNode, sources: IdRange):
+      BundleBridgeSource[DecoupledIO[CacheAccessResult]] = this {
+    require(!resultClients.exists(_._1 eq client), "cache result client registered twice")
+
+    val accessResult = BundleBridgeSource(() =>
+      Decoupled(new CacheAccessResult(math.max(1, log2Ceil(sources.end)))))
+    resultClients += ((client, sources, accessResult))
+    accessResult
+  }
+
   val access = TransferSizes(1, cache.blockBytes)
   val xfer = TransferSizes(cache.blockBytes, cache.blockBytes)
   val atom = TransferSizes(1, cache.beatBytes)
@@ -123,7 +136,16 @@ class InclusiveCache(
     }
 
     // Create the L2 Banks
-    val mods = (node.in zip node.out) map { case ((in, edgeIn), (out, edgeOut)) =>
+    val resultMappings = node.edges.in.map { edge =>
+      val maps = resultClients.map { case (client, sources, _) =>
+        CacheAccessResultMapping(client, sources, node, edge)
+      }.toSeq
+      val sources = maps.flatMap(m => m.remote.start until m.remote.end)
+      require(sources.distinct.size == sources.size, "overlapping cache result sources")
+      maps
+    }
+    require(resultClients.isEmpty || node.edges.in.nonEmpty, "cache results require an L2 bank")
+    val mods = (node.in zip node.out).zipWithIndex map { case (((in, edgeIn), (out, edgeOut)), bank) =>
       edgeOut.manager.managers.foreach { m =>
         require (m.supportsAcquireB.contains(xfer),
           s"All managers behind the L2 must support acquireB($xfer) " +
@@ -134,7 +156,8 @@ class InclusiveCache(
       }
 
       val params = InclusiveCacheParameters(cache, micro, !ctrls.isEmpty, edgeIn, edgeOut)
-      val scheduler = Module(new InclusiveCacheBankScheduler(params)).suggestName("inclusive_cache_bank_sched")
+      val observed = resultMappings(bank).flatMap(m => m.remote.start until m.remote.end)
+      val scheduler = Module(new InclusiveCacheBankScheduler(params, observed)).suggestName("inclusive_cache_bank_sched")
 
       scheduler.io.in <> in
       out <> scheduler.io.out
@@ -156,6 +179,32 @@ class InclusiveCache(
       out.c.bits.address := params.restoreAddress(scheduler.io.out.c.bits.address)
 
       scheduler
+    }
+
+    val resultArbiters = resultClients.toSeq.zipWithIndex.map { case ((_, sources, port), client) =>
+      val arbiter = Module(new RRArbiter(new CacheAccessResult(
+        math.max(1, log2Ceil(sources.end))), mods.size))
+      val output = Module(new Queue(chiselTypeOf(arbiter.io.out.bits), 2))
+      output.io.enq <> arbiter.io.out
+      port.bundle <> output.io.deq
+      mods.zipWithIndex.foreach { case (bank, i) =>
+        val mapping = resultMappings(i)(client)
+        arbiter.io.in(i).valid := bank.io.access_result.valid &&
+          mapping.remote.contains(bank.io.access_result.bits.source)
+        arbiter.io.in(i).bits.source := bank.io.access_result.bits.source - mapping.offset.U
+        arbiter.io.in(i).bits.miss := bank.io.access_result.bits.miss
+      }
+      arbiter
+    }
+    if (resultClients.nonEmpty) {
+      mods.zipWithIndex.foreach { case (bank, i) =>
+        val selected = resultMappings(i).map(_.remote.contains(bank.io.access_result.bits.source))
+        bank.io.access_result.ready := Mux1H(selected, resultArbiters.map(_.io.in(i).ready))
+
+        when (bank.io.access_result.valid) {
+          assert(PopCount(VecInit(selected)) === 1.U, "cache result has no unique destination")
+        }
+      }
     }
 
     ctrls.foreach { ctrl =>

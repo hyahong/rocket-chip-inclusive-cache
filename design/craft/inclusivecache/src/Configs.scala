@@ -106,6 +106,10 @@ class WithInclusiveCache(
         outerBuf = bufOuterInterior),
       l2Ctrl))
 
+    require(!context.anyLocationMap.contains(CacheAccessResultLocation),
+      "only one L2 cache result provider is supported per subsystem")
+    context.anyLocationMap += (CacheAccessResultLocation -> l2)
+
     def skipMMIO(x: TLClientParameters) = {
       val dcacheMMIO =
         x.requestFifo &&
