@@ -146,6 +146,7 @@ class InclusiveCache(
       scheduler.io.req.bits.address := 0.U
       scheduler.io.req.bits.invalidate := false.B
       scheduler.io.resp.ready := true.B
+      scheduler.io.access_result.ready := true.B
 
 
       // Fix-up the missing addresses. We do this here so that the Scheduler can be

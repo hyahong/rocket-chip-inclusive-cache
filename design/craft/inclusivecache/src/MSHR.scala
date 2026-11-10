@@ -84,14 +84,16 @@ case object S_TRUNK_CD extends CacheState
 class MSHR(params: InclusiveCacheParameters) extends Module
 {
   val io = IO(new Bundle {
-    val allocate  = Flipped(Valid(new AllocateRequest(params))) // refills MSHR for next cycle
-    val directory = Flipped(Valid(new DirectoryResult(params))) // triggers schedule setup
-    val status    = Valid(new MSHRStatus(params))
-    val schedule  = Decoupled(new ScheduleRequest(params))
-    val sinkc     = Flipped(Valid(new SinkCResponse(params)))
-    val sinkd     = Flipped(Valid(new SinkDResponse(params)))
-    val sinke     = Flipped(Valid(new SinkEResponse(params)))
-    val nestedwb  = Flipped(new NestedWriteback(params))
+    val allocate      = Flipped(Valid(new AllocateRequest(params))) // refills MSHR for next cycle
+    val directory     = Flipped(Valid(new DirectoryResult(params))) // triggers schedule setup
+    val status        = Valid(new MSHRStatus(params))
+    val schedule      = Decoupled(new ScheduleRequest(params))
+    val sinkc         = Flipped(Valid(new SinkCResponse(params)))
+    val sinkd         = Flipped(Valid(new SinkDResponse(params)))
+    val sinke         = Flipped(Valid(new SinkEResponse(params)))
+    val nestedwb      = Flipped(new NestedWriteback(params))
+    val lookup_result = Valid(new CacheAccessLookup(params))
+    val pending_miss  = Valid(new CacheBlockAddress(params))
   })
 
   val request_valid = RegInit(false.B)
@@ -509,6 +511,22 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   val new_clientBit = params.clientBit(new_request.source)
   val new_skipProbe = Mux(skipProbeN(new_request.opcode, params.cache.hintsSkipProbe), new_clientBit, 0.U)
 
+  val lookup_valid = io.directory.valid || (io.allocate.valid && io.allocate.bits.repeat)
+  val lookup_is_a = new_request.prio(0) && !new_request.control.flush
+  io.lookup_result.valid := lookup_valid && lookup_is_a
+  io.lookup_result.bits.source := new_request.source
+  io.lookup_result.bits.set := new_request.set
+  io.lookup_result.bits.tag := new_request.tag
+  io.lookup_result.bits.miss := !new_meta.hit
+
+  val data_miss = RegInit(false.B)
+  when (lookup_valid) { data_miss := lookup_is_a && !new_meta.hit }
+  val refill_done = io.sinkd.valid && io.sinkd.bits.last &&
+    (io.sinkd.bits.opcode === Grant || io.sinkd.bits.opcode === GrantData)
+  io.pending_miss.valid := request_valid && meta_valid && data_miss && !w_grantlast && !refill_done
+  io.pending_miss.bits.set := request.set
+  io.pending_miss.bits.tag := request.tag
+
   val prior = cacheState(final_meta_writeback, true.B)
   def bypass(from: CacheState, cover: Boolean)(implicit sourceInfo: SourceInfo) {
     if (cover) {
@@ -537,7 +555,7 @@ class MSHR(params: InclusiveCacheParameters) extends Module
   }
 
   // Create execution plan
-  when (io.directory.valid || (io.allocate.valid && io.allocate.bits.repeat)) {
+  when (lookup_valid) {
     meta_valid := true.B
     meta := new_meta
     probes_done := 0.U

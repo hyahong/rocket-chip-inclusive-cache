@@ -24,7 +24,7 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util._
 import chisel3.experimental.dataview._
 
-class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Module
+class InclusiveCacheBankScheduler(params: InclusiveCacheParameters, resultSources: Seq[Int] = Nil) extends Module
 {
   val io = IO(new Bundle {
     val in = Flipped(TLBundle(params.inner.bundle))
@@ -35,6 +35,7 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
     // Control port
     val req = Flipped(Decoupled(new SinkXRequest(params)))
     val resp = Decoupled(new SourceXRequest(params))
+    val access_result = Decoupled(new CacheAccessResult(params.inner.bundle.sourceBits))
   })
 
   val sourceA = Module(new SourceA(params))
@@ -73,6 +74,25 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
   val bc_mshr = mshrs.init.last
   val c_mshr = mshrs.last
   val nestedwb = Wire(new NestedWriteback(params))
+
+  val result_ready = WireInit(true.B)
+  io.access_result.valid := false.B
+  io.access_result.bits := 0.U.asTypeOf(io.access_result.bits)
+  if (resultSources.nonEmpty) {
+    val tracker = Module(new CacheResultTracker(params, resultSources))
+    val observe = sinkA.io.req.bits.opcode === TLMessages.AcquireBlock
+    tracker.io.request.valid := sinkA.io.req.fire && observe
+    tracker.io.request.bits.source := sinkA.io.req.bits.source
+    tracker.io.request.bits.set := sinkA.io.req.bits.set
+    tracker.io.request.bits.tag := sinkA.io.req.bits.tag
+    result_ready := !observe || tracker.io.ready
+    tracker.io.lookup := VecInit(mshrs.map(_.io.lookup_result))
+    tracker.io.pending_miss := VecInit(mshrs.map(_.io.pending_miss))
+    tracker.io.complete.valid := io.in.d.fire && params.inner.last(io.in.d) &&
+      (io.in.d.bits.opcode === TLMessages.Grant || io.in.d.bits.opcode === TLMessages.GrantData)
+    tracker.io.complete.bits := io.in.d.bits.source
+    io.access_result <> tracker.io.result
+  }
 
   // Deliver messages from Sinks to MSHRs
   mshrs.zipWithIndex.foreach { case (m, i) =>
@@ -161,12 +181,12 @@ class InclusiveCacheBankScheduler(params: InclusiveCacheParameters) extends Modu
 
   // Pick highest priority request
   val request = Wire(Decoupled(new FullRequest(params)))
-  request.valid := directory.io.ready && (sinkA.io.req.valid || sinkX.io.req.valid || sinkC.io.req.valid)
+  request.valid := directory.io.ready && ((sinkA.io.req.valid && result_ready) || sinkX.io.req.valid || sinkC.io.req.valid)
   request.bits := Mux(sinkC.io.req.valid, sinkC.io.req.bits,
                   Mux(sinkX.io.req.valid, sinkX.io.req.bits, sinkA.io.req.bits))
   sinkC.io.req.ready := directory.io.ready && request.ready
   sinkX.io.req.ready := directory.io.ready && request.ready && !sinkC.io.req.valid
-  sinkA.io.req.ready := directory.io.ready && request.ready && !sinkC.io.req.valid && !sinkX.io.req.valid
+  sinkA.io.req.ready := directory.io.ready && request.ready && !sinkC.io.req.valid && !sinkX.io.req.valid && result_ready
 
   // If no MSHR has been assigned to this set, we need to allocate one
   val setMatches = Cat(mshrs.map { m => m.io.status.valid && m.io.status.bits.set === request.bits.set }.reverse)
